@@ -20,6 +20,7 @@ import Phaser from 'phaser';
 import { SagaIterator } from 'redux-saga';
 import { call, delay, put, race, select, take, takeEvery } from 'redux-saga/effects';
 import * as Sourceror from 'sourceror';
+import { DeviceSession } from 'src/features/remoteExecution/RemoteExecutionTypes';
 
 import { PlaygroundState } from '../../features/playground/PlaygroundTypes';
 import { OverallState, styliseChapter } from '../application/ApplicationTypes';
@@ -33,7 +34,7 @@ import {
   EVAL_TESTCASE_SUCCESS,
   HIGHLIGHT_LINE
 } from '../application/types/InterpreterTypes';
-import { Testcase, TestcaseType, TestcaseTypes } from '../assessment/AssessmentTypes';
+import { Library, Testcase, TestcaseType, TestcaseTypes } from '../assessment/AssessmentTypes';
 import { INVALID_EDITOR_SESSION_ID } from '../collabEditing/CollabEditingTypes';
 import { Documentation } from '../documentation/Documentation';
 import { SideContentType } from '../sideContent/SideContentTypes';
@@ -71,46 +72,34 @@ let breakpoints: string[] = [];
 export default function* WorkspaceSaga(): SagaIterator {
   let context: Context;
 
-  yield takeEvery(EVAL_EDITOR, function* (action: ReturnType<typeof actions.evalEditor>) {
-    const workspaceLocation = action.payload.workspaceLocation;
-    const code: string = yield select((state: OverallState) => {
-      const prependCode = state.workspaces[workspaceLocation].editorPrepend;
-      const editorCode = state.workspaces[workspaceLocation].editorValue!;
-      return [prependCode, editorCode] as [string, string];
+  yield takeEvery(EVAL_EDITOR, function* ({
+    payload: { workspaceLocation }
+  }: ReturnType<typeof actions.evalEditor>) {
+    const [prepend, editorCode, execTime, remoteExecutionSession, library]: [
+      string,
+      string,
+      number,
+      DeviceSession | undefined,
+      Library
+    ] = yield select((state: OverallState) => {
+      const library: Library = {
+        chapter: state.workspaces[workspaceLocation].context.chapter,
+        variant: state.workspaces[workspaceLocation].context.variant,
+        external: {
+          name: ExternalLibraryName.NONE,
+          symbols: state.workspaces[workspaceLocation].context.externalSymbols
+        },
+        globals: state.workspaces[workspaceLocation].globals
+      };
+      return [
+        state.workspaces[workspaceLocation].editorPrepend,
+        state.workspaces[workspaceLocation].editorValue!,
+        state.workspaces[workspaceLocation].execTime,
+        state.session.remoteExecutionSession,
+        library
+      ];
     });
-    const [prepend, tempvalue] = code;
-    const exploded = tempvalue.split('\n');
-    for (const i in breakpoints) {
-      if (typeof i === 'string') {
-        const index: number = +i;
-        exploded[index] = 'debugger;' + exploded[index];
-      }
-    }
-    const value = exploded.join('\n');
-    const chapter: number = yield select(
-      (state: OverallState) => state.workspaces[workspaceLocation].context.chapter
-    );
-    const execTime: number = yield select(
-      (state: OverallState) => state.workspaces[workspaceLocation].execTime
-    );
-    const symbols: string[] = yield select(
-      (state: OverallState) => state.workspaces[workspaceLocation].context.externalSymbols
-    );
-    const globals: Array<[string, any]> = yield select(
-      (state: OverallState) => state.workspaces[workspaceLocation].globals
-    );
-    const variant: Variant = yield select(
-      (state: OverallState) => state.workspaces[workspaceLocation].context.variant
-    );
-    const library = {
-      chapter,
-      variant,
-      external: {
-        name: ExternalLibraryName.NONE,
-        symbols
-      },
-      globals
-    };
+
     // End any code that is running right now.
     yield put(actions.beginInterruptExecution(workspaceLocation));
     // Clear the context, with the same chapter and externalSymbols as before.
@@ -118,15 +107,28 @@ export default function* WorkspaceSaga(): SagaIterator {
     yield put(actions.clearReplOutput(workspaceLocation));
     context = yield select((state: OverallState) => state.workspaces[workspaceLocation].context);
 
-    // Evaluate the prepend silently with a privileged context, if it exists
-    if (prepend.length) {
-      const elevatedContext = makeElevatedContext(context);
-      yield call(evalCode, prepend, elevatedContext, execTime, workspaceLocation, EVAL_SILENT);
-      // Block use of methods from privileged context
-      yield* blockExtraMethods(elevatedContext, context, execTime, workspaceLocation);
-    }
+    if (remoteExecutionSession && remoteExecutionSession.workspace === workspaceLocation) {
+      yield put(actions.remoteExecRun(editorCode));
+    } else {
+      const exploded = editorCode.split('\n');
+      for (const i in breakpoints) {
+        if (typeof i === 'string') {
+          const index: number = +i;
+          exploded[index] = 'debugger;' + exploded[index];
+        }
+      }
+      const value = exploded.join('\n');
 
-    yield call(evalCode, value, context, execTime, workspaceLocation, EVAL_EDITOR);
+      // Evaluate the prepend silently with a privileged context, if it exists
+      if (prepend.length) {
+        const elevatedContext = makeElevatedContext(context);
+        yield call(evalCode, prepend, elevatedContext, execTime, workspaceLocation, EVAL_SILENT);
+        // Block use of methods from privileged context
+        yield* blockExtraMethods(elevatedContext, context, execTime, workspaceLocation);
+      }
+
+      yield call(evalCode, value, context, execTime, workspaceLocation, EVAL_EDITOR);
+    }
   });
 
   yield takeEvery(PROMPT_AUTOCOMPLETE, function* (
